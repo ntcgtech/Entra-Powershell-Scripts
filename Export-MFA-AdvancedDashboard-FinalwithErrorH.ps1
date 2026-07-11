@@ -1,0 +1,896 @@
+﻿<#
+.SYNOPSIS
+    Microsoft Entra ID MFA Executive Dashboard
+
+.DESCRIPTION
+    Generates a vibrant HTML report for Microsoft Entra authentication methods.
+
+.FEATURES
+    - MFA registration summary
+    - Authenticator Passwordless count
+    - FIDO2 count using authentication methods API
+    - Windows Hello for Business count
+    - Phishing-resistant MFA detection
+    - Risk scoring
+    - Search and dropdown filters
+    - CSV and Excel export
+    - Handles Microsoft Graph pagination and skiptoken cleanly
+
+.REQUIRED GRAPH PERMISSIONS
+    Reports.Read.All
+    User.Read.All
+    UserAuthenticationMethod.Read.All
+#>
+
+# ================================
+# Configuration
+# ================================
+
+$ReportPath = ".\MFA_Executive_Report.html"
+$GeneratedOn = Get-Date -Format "dd-MMM-yyyy HH:mm:ss"
+
+# ================================
+# Install / Import Microsoft Graph
+# ================================
+
+if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
+    Write-Host "Microsoft.Graph module not found. Installing..." -ForegroundColor Yellow
+    Install-Module Microsoft.Graph -Scope CurrentUser -Force
+}
+
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+
+# ================================
+# Connect to Microsoft Graph
+# ================================
+
+Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
+
+Connect-MgGraph -Scopes `
+    "Reports.Read.All", `
+    "User.Read.All", `
+    "UserAuthenticationMethod.Read.All" `
+    -NoWelcome
+
+# ================================
+# Helper: Get Paged Graph Results
+# Handles @odata.nextLink and skiptoken silently
+# ================================
+
+function Get-GraphPagedResults {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+
+        [switch]$VerbosePaging
+    )
+
+    $Results = @()
+    $NextLink = $Uri
+    $Page = 1
+
+    while ($NextLink) {
+        try {
+            if ($VerbosePaging) {
+                Write-Host "Fetching Graph page $Page..." -ForegroundColor DarkGray
+            }
+
+            $Response = Invoke-MgGraphRequest -Method GET -Uri $NextLink -ErrorAction Stop
+
+            if ($Response.value) {
+                $Results += $Response.value
+            }
+
+            $NextLink = $Response.'@odata.nextLink'
+            $Page++
+        }
+        catch {
+            Write-Warning "Graph request failed. Error: $($_.Exception.Message)"
+            break
+        }
+    }
+
+    return $Results
+}
+
+# ================================
+# Helper: Safe Graph Property Reader
+# ================================
+
+function Get-GraphObjectValue {
+    param (
+        [object]$Object,
+        [string]$PropertyName
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($PropertyName)) {
+            return $Object[$PropertyName]
+        }
+    }
+
+    $Property = $Object.PSObject.Properties[$PropertyName]
+    if ($Property) {
+        return $Property.Value
+    }
+
+    return $null
+}
+
+# ================================
+# Helper: HTML Encode
+# ================================
+
+function ConvertTo-SafeHtml {
+    param (
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+}
+
+# ================================
+# Helper: Authentication Method Flags
+# Pulls actual authentication methods per user
+# ================================
+
+function Get-UserAuthenticationMethodFlags {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$UPN
+    )
+
+    $Result = [PSCustomObject]@{
+        FIDO2     = $false
+        WHfB      = $false
+        TypeNames = @()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($UPN)) {
+        return $Result
+    }
+
+    try {
+        $EncodedUPN = [System.Uri]::EscapeDataString($UPN)
+        $Uri = "https://graph.microsoft.com/v1.0/users/$EncodedUPN/authentication/methods"
+
+        $AllMethods = Get-GraphPagedResults -Uri $Uri
+
+        foreach ($Method in $AllMethods) {
+            $ODataType = Get-GraphObjectValue -Object $Method -PropertyName "@odata.type"
+
+            if ($ODataType) {
+                $ShortType = $ODataType -replace "#microsoft.graph.", ""
+                $Result.TypeNames += $ShortType
+
+                if ($ODataType -like "*fido2AuthenticationMethod*") {
+                    $Result.FIDO2 = $true
+                }
+
+                if ($ODataType -like "*windowsHelloForBusinessAuthenticationMethod*") {
+                    $Result.WHfB = $true
+                }
+            }
+        }
+    }
+    catch {
+        Write-Warning "Could not read authentication methods for $UPN. Error: $($_.Exception.Message)"
+    }
+
+    return $Result
+}
+
+# ================================
+# Pull MFA Registration Details
+# ================================
+
+Write-Host "Retrieving MFA registration details..." -ForegroundColor Cyan
+
+$RegistrationUri = "https://graph.microsoft.com/beta/reports/authenticationMethods/userRegistrationDetails"
+$MFARegistrationDetails = Get-GraphPagedResults -Uri $RegistrationUri
+
+if (-not $MFARegistrationDetails -or $MFARegistrationDetails.Count -eq 0) {
+    Write-Warning "No MFA registration data found."
+    return
+}
+
+Write-Host "Users retrieved: $($MFARegistrationDetails.Count)" -ForegroundColor Green
+
+# ================================
+# Process Data
+# ================================
+
+$Counter = 0
+
+$ReportData = foreach ($User in $MFARegistrationDetails) {
+
+    $Counter++
+
+    Write-Progress `
+        -Activity "Processing users and authentication methods" `
+        -Status "$Counter of $($MFARegistrationDetails.Count): $($User.userPrincipalName)" `
+        -PercentComplete (($Counter / $MFARegistrationDetails.Count) * 100)
+
+    $Methods = @()
+    if ($User.methodsRegistered) {
+        $Methods = @($User.methodsRegistered)
+    }
+
+    $NormalizedMethods = @(
+        $Methods | ForEach-Object {
+            ([string]$_).ToLowerInvariant() -replace "[^a-z0-9]", ""
+        }
+    )
+
+    $AuthFlags = Get-UserAuthenticationMethodFlags -UPN $User.userPrincipalName
+
+    # Windows Hello for Business detection
+    $WHfB = $false
+    if (
+        $NormalizedMethods -contains "windowshelloforbusiness" -or
+        $AuthFlags.WHfB -eq $true
+    ) {
+        $WHfB = $true
+    }
+
+    # FIDO2 detection
+    $FIDO2 = $false
+    if (
+        $NormalizedMethods -contains "fido2securitykey" -or
+        $NormalizedMethods -contains "fido2authenticationmethod" -or
+        $AuthFlags.FIDO2 -eq $true
+    ) {
+        $FIDO2 = $true
+    }
+
+    # Authenticator Passwordless detection
+    $AuthenticatorPasswordless = $false
+    if (
+        $NormalizedMethods -contains "microsoftauthenticatorpasswordless" -or
+        $NormalizedMethods -contains "passwordlessmicrosoftauthenticator"
+    ) {
+        $AuthenticatorPasswordless = $true
+    }
+
+    # Phishing-resistant MFA
+    $PhishingResistant = $FIDO2 -or $WHfB
+
+    # Risk scoring
+    if (-not $User.isMfaRegistered) {
+        $Risk = "High"
+    }
+    elseif (-not $PhishingResistant) {
+        $Risk = "Medium"
+    }
+    else {
+        $Risk = "Low"
+    }
+
+    $MethodsText = if ($Methods.Count -gt 0) {
+        $Methods -join ", "
+    }
+    else {
+        "None"
+    }
+
+    $AuthApiTypesText = if ($AuthFlags.TypeNames.Count -gt 0) {
+        $AuthFlags.TypeNames -join ", "
+    }
+    else {
+        "None"
+    }
+
+    [PSCustomObject]@{
+        DisplayName                 = $User.userDisplayName
+        UserPrincipalName           = $User.userPrincipalName
+        UserType                    = $User.userType
+        AdminStatus                 = if ($User.isAdmin) { "Admin" } else { "User" }
+        MFARegistered               = if ($User.isMfaRegistered) { "Yes" } else { "No" }
+        MFACapable                  = if ($User.isMfaCapable) { "Yes" } else { "No" }
+        PasswordlessCapable         = if ($User.isPasswordlessCapable) { "Yes" } else { "No" }
+        AuthenticatorPasswordless   = if ($AuthenticatorPasswordless) { "Yes" } else { "No" }
+        FIDO2                       = if ($FIDO2) { "Yes" } else { "No" }
+        WHfB                        = if ($WHfB) { "Yes" } else { "No" }
+        PhishingResistant           = if ($PhishingResistant) { "Yes" } else { "No" }
+        Risk                        = $Risk
+        DefaultMfaMethod            = $User.defaultMfaMethod
+        MethodsRegistered           = $MethodsText
+        AuthApiMethodTypes          = $AuthApiTypesText
+        LastUpdated                 = $User.lastUpdatedDateTime
+    }
+}
+
+Write-Progress -Activity "Processing users and authentication methods" -Completed
+
+# ================================
+# KPI Calculations
+# ================================
+
+$TotalUsers       = @($ReportData).Count
+$MFAUsers         = @($ReportData | Where-Object { $_.MFARegistered -eq "Yes" }).Count
+$NoMFAUsers       = $TotalUsers - $MFAUsers
+$AdminUsers       = @($ReportData | Where-Object { $_.AdminStatus -eq "Admin" }).Count
+
+$AuthPwdlessUsers = @($ReportData | Where-Object { $_.AuthenticatorPasswordless -eq "Yes" }).Count
+$FIDO2Users       = @($ReportData | Where-Object { $_.FIDO2 -eq "Yes" }).Count
+$WHfBUsers        = @($ReportData | Where-Object { $_.WHfB -eq "Yes" }).Count
+$PhishingUsers    = @($ReportData | Where-Object { $_.PhishingResistant -eq "Yes" }).Count
+
+$HighRiskUsers    = @($ReportData | Where-Object { $_.Risk -eq "High" }).Count
+$MediumRiskUsers  = @($ReportData | Where-Object { $_.Risk -eq "Medium" }).Count
+$LowRiskUsers     = @($ReportData | Where-Object { $_.Risk -eq "Low" }).Count
+
+$MFAPercent = if ($TotalUsers -gt 0) {
+    [Math]::Round(($MFAUsers / $TotalUsers) * 100, 1)
+}
+else {
+    0
+}
+
+$PhishingPercent = if ($TotalUsers -gt 0) {
+    [Math]::Round(($PhishingUsers / $TotalUsers) * 100, 1)
+}
+else {
+    0
+}
+
+Write-Host "FIDO2 Users Detected: $FIDO2Users" -ForegroundColor Green
+Write-Host "Authenticator Passwordless Users Detected: $AuthPwdlessUsers" -ForegroundColor Green
+Write-Host "WHfB Users Detected: $WHfBUsers" -ForegroundColor Green
+Write-Host "Phishing Resistant MFA Users Detected: $PhishingUsers" -ForegroundColor Green
+
+# ================================
+# Build HTML Table Rows
+# ================================
+
+$TableRows = foreach ($Row in $ReportData | Sort-Object UserPrincipalName) {
+
+    $Name          = ConvertTo-SafeHtml $Row.DisplayName
+    $UPN           = ConvertTo-SafeHtml $Row.UserPrincipalName
+    $UserType      = ConvertTo-SafeHtml $Row.UserType
+    $AdminStatus   = ConvertTo-SafeHtml $Row.AdminStatus
+    $MFA           = ConvertTo-SafeHtml $Row.MFARegistered
+    $AuthPwdless   = ConvertTo-SafeHtml $Row.AuthenticatorPasswordless
+    $FIDO2         = ConvertTo-SafeHtml $Row.FIDO2
+    $WHfB          = ConvertTo-SafeHtml $Row.WHfB
+    $Phishing      = ConvertTo-SafeHtml $Row.PhishingResistant
+    $Risk          = ConvertTo-SafeHtml $Row.Risk
+    $DefaultMethod = ConvertTo-SafeHtml $Row.DefaultMfaMethod
+    $Methods       = ConvertTo-SafeHtml $Row.MethodsRegistered
+    $ApiTypes      = ConvertTo-SafeHtml $Row.AuthApiMethodTypes
+    $Updated       = ConvertTo-SafeHtml $Row.LastUpdated
+
+    $DataAdmin = if ($Row.AdminStatus -eq "Admin") { "yes" } else { "no" }
+    $DataMFA   = if ($Row.MFARegistered -eq "Yes") { "yes" } else { "no" }
+    $DataAuth  = if ($Row.AuthenticatorPasswordless -eq "Yes") { "yes" } else { "no" }
+    $DataFIDO2 = if ($Row.FIDO2 -eq "Yes") { "yes" } else { "no" }
+    $DataWHfB  = if ($Row.WHfB -eq "Yes") { "yes" } else { "no" }
+    $DataPhish = if ($Row.PhishingResistant -eq "Yes") { "yes" } else { "no" }
+    $DataRisk  = $Row.Risk.ToLowerInvariant()
+
+@"
+<tr data-admin="$DataAdmin" data-mfa="$DataMFA" data-auth="$DataAuth" data-fido2="$DataFIDO2" data-whfb="$DataWHfB" data-phish="$DataPhish" data-risk="$DataRisk">
+    <td>$Name</td>
+    <td>$UPN</td>
+    <td>$UserType</td>
+    <td><span class="badge badge-admin-$DataAdmin">$AdminStatus</span></td>
+    <td><span class="badge badge-yesno-$DataMFA">$MFA</span></td>
+    <td><span class="badge badge-yesno-$DataAuth">$AuthPwdless</span></td>
+    <td><span class="badge badge-yesno-$DataFIDO2">$FIDO2</span></td>
+    <td><span class="badge badge-yesno-$DataWHfB">$WHfB</span></td>
+    <td><span class="badge badge-yesno-$DataPhish">$Phishing</span></td>
+    <td><span class="risk-pill risk-$DataRisk">$Risk</span></td>
+    <td>$DefaultMethod</td>
+    <td>$Methods</td>
+    <td>$ApiTypes</td>
+    <td>$Updated</td>
+</tr>
+"@
+}
+
+# ================================
+# HTML Report
+# ================================
+
+$Html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MFA Executive Security Dashboard</title>
+
+<style>
+    * {
+        box-sizing: border-box;
+    }
+
+    body {
+        font-family: "Segoe UI", Arial, sans-serif;
+        margin: 0;
+        background: #eef2ff;
+        color: #111827;
+    }
+
+    .header {
+        background: linear-gradient(135deg, #2563eb, #7c3aed, #db2777);
+        color: white;
+        padding: 32px 40px;
+        box-shadow: 0 8px 28px rgba(37, 99, 235, 0.35);
+    }
+
+    .header h1 {
+        margin: 0;
+        font-size: 32px;
+        font-weight: 800;
+        letter-spacing: -0.5px;
+    }
+
+    .header p {
+        margin: 8px 0 0;
+        opacity: 0.95;
+        font-size: 14px;
+    }
+
+    .container {
+        padding: 28px 36px;
+    }
+
+    .kpi-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+        gap: 16px;
+        margin-bottom: 24px;
+    }
+
+    .kpi-card {
+        border-radius: 18px;
+        padding: 20px;
+        color: white;
+        box-shadow: 0 10px 26px rgba(15, 23, 42, 0.16);
+        min-height: 110px;
+        position: relative;
+        overflow: hidden;
+    }
+
+    .kpi-card::after {
+        content: "";
+        position: absolute;
+        right: -30px;
+        top: -30px;
+        width: 100px;
+        height: 100px;
+        background: rgba(255,255,255,0.16);
+        border-radius: 50%;
+    }
+
+    .kpi-title {
+        font-sizeansform: uppercase;
+        letter-spacing: .6px;
+        opacity: .92;
+        font-weight: 700;
+    }
+
+    .kpi-number {
+        font-size: 34px;
+        font-weight: 800;
+        margin-top: 10px;
+    }
+
+    .blue { background: linear-gradient(135deg, #2563eb, #1d4ed8); }
+    .green { background: linear-gradient(135deg, #22c55e, #15803d); }
+    .red { background: linear-gradient(135deg, #ef4444, #b91c1c); }
+    .purple { background: linear-gradient(135deg, #a855f7, #7e22ce); }
+    .orange { background: linear-gradient(135deg, #f97316, #c2410c); }
+    .pink { background: linear-gradient(135deg, #ec4899, #be185d); }
+    .teal { background: linear-gradient(135deg, #14b8a6, #0f766e); }
+    .dark { background: linear-gradient(135deg, #334155, #0f172a); }
+
+    .insight-strip {
+        background: white;
+        border-radius: 16px;
+        padding: 16px 18px;
+        margin-bottom: 22px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.08);
+        border-left: 6px solid #7c3aed;
+        color: #374151;
+    }
+
+    .table-card {
+        background: white;
+        border-radius: 18px;
+        padding: 20px;
+        box-shadow: 0 10px 26px rgba(15, 23, 42, 0.10);
+        overflow-x: auto;
+    }
+
+    .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-bottom: 16px;
+        align-items: center;
+    }
+
+    input, select {
+        padding: 11px 12px;
+        border: 1px solid #cbd5e1;
+        border-radius: 10px;
+        font-size: 14px;
+        outline: none;
+        min-width: 210px;
+        background: #f8fafc;
+    }
+
+    input:focus, select:focus {
+        border-color: #6366f1;
+        box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+        background: white;
+    }
+
+    button {
+        padding: 11px 14px;
+        border: none;
+        border-radius: 10px;
+        background: linear-gradient(135deg, #2563eb, #7c3aed);
+        color: white;
+        font-weight: 700;
+        cursor: pointer;
+        box-shadow: 0 6px 16px rgba(37, 99, 235, 0.22);
+    }
+
+    button:hover {
+        transform: translateY(-1px);
+    }
+
+    .count-label {
+        margin-left: auto;
+        font-size: 13px;
+        color: #475569;
+        font-weight: 700;
+    }
+
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+    }
+
+    th {
+        background: #eef2ff;
+        color: #3730a3;
+        text-align: left;
+        padding: 12px;
+        border-bottom: 2px solid #c7d2fe;
+        white-space: nowrap;
+        position: sticky;
+        top: 0;
+        z-index: 1;
+    }
+
+    td {
+        padding: 12px;
+        border-bottom: 1px solid #e5e7eb;
+        vertical-align: top;
+    }
+
+    tr:hover {
+        background: #f8fafc;
+    }
+
+    .badge {
+        display: inline-block;
+        padding: 5px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+        white-space: nowrap;
+    }
+
+    .badge-yesno-yes {
+        background: #dcfce7;
+        color: #166534;
+    }
+
+    .badge-yesno-no {
+        background: #fee2e2;
+        color: #991b1b;
+    }
+
+    .badge-admin-yes {
+        background: #f3e8ff;
+        color: #6b21a8;
+    }
+
+    .badge-admin-no {
+        background: #e2e8f0;
+        color: #334155;
+    }
+
+    .risk-pill {
+        display: inline-block;
+        padding: 6px 11px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 800;
+    }
+
+    .risk-high {
+        background: #fee2e2;
+        color: #991b1b;
+    }
+
+    .risk-medium {
+        background: #ffedd5;
+        color: #9a3412;
+    }
+
+    .risk-low {
+        background: #dcfce7;
+        color: #166534;
+    }
+
+    .footer {
+        margin-top: 18px;
+        text-align: center;
+        font-size: 12px;
+        color: #64748b;
+    }
+</style>
+</head>
+
+<body>
+
+<div class="header">
+    <h1>Microsoft Entra ID MFA Executive Security Dashboard</h1>
+    <p>Generated on: $GeneratedOn</p>
+</div>
+
+<div class="container">
+
+    <div class="kpi-grid">
+        <div class="kpi-card blue">
+            <div class="kpi-title">Total Users</div>
+            <div class="kpi-number">$($TotalUsers)</div>
+        </div>
+
+        <div class="kpi-card green">
+            <div class="kpi-title">MFA Registered</div>
+            <div class="kpi-number">$($MFAUsers)</div>
+        </div>
+
+        <div class="kpi-card red">
+            <div class="kpi-title">Not MFA Registered</div>
+            <div class="kpi-number">$($NoMFAUsers)</div>
+        </div>
+
+        <div class="kpi-card purple">
+            <div class="kpi-title">MFA Adoption</div>
+            <div class="kpi-number">$($MFAPercent)%</div>
+        </div>
+
+        <div class="kpi-card pink">
+            <div class="kpi-title">Authenticator Passwordless</div>
+            <div class="kpi-number">$($AuthPwdlessUsers)</div>
+        </div>
+
+        <div class="kpi-card teal">
+            <div class="kpi-title">FIDO2 Users</div>
+            <div class="kpi-number">$($FIDO2Users)</div>
+        </div>
+
+        <div class="kpi-card orange">
+            <div class="kpi-title">Windows Hello for Business</div>
+            <div class="kpi-number">$($WHfBUsers)</div>
+        </div>
+
+        <div class="kpi-card dark">
+            <div class="kpi-title">Phishing Resistant MFA</div>
+            <div class="kpi-number">$($PhishingUsers)</div>
+        </div>
+    </div>
+
+    <div class="insight-strip">
+        <strong>Executive Snapshot:</strong>
+        MFA adoption is <strong>$($MFAPercent)%</strong>.
+        Phishing-resistant MFA coverage is <strong>$($PhishingPercent)%</strong>.
+        Risk distribution:
+        <strong>$($HighRiskUsers)</strong> High,
+        <strong>$($MediumRiskUsers)</strong> Medium,
+        <strong>$($LowRiskUsers)</strong> Low.
+    </div>
+
+    <div class="table-card">
+
+        <div class="controls">
+            <input type="text" id="searchBox" placeholder="Search by name, UPN, method, risk..." onkeyup="applyFilters()">
+
+            <select id="filterDropdown" onchange="applyFilters()">
+                <option value="all">All Users</option>
+                <option value="admin">Admins Only</option>
+                <option value="mfa">MFA Registered</option>
+                <option value="nomfa">Not MFA Registered</option>
+                <option value="authpwdless">Authenticator Passwordless</option>
+                <option value="fido2">FIDO2</option>
+                <option value="whfb">Windows Hello for Business</option>
+                <option value="phish">Phishing Resistant MFA</option>
+                <option value="high">High Risk</option>
+                <option value="medium">Medium Risk</option>
+                <option value="low">Low Risk</option>
+            </select>
+
+            <button onclick="exportCSV()">Export CSV</button>
+            <button onclick="exportExcel()">Export Excel</button>
+
+            <div class="count-label">
+                Visible Rows: <span id="visibleCount">$($TotalUsers)</span>
+            </div>
+        </div>
+
+        <table id="mfaTable">
+            <thead>
+                <tr>
+                    <th>Display Name</th>
+                    <th>User Principal Name</th>
+                    <th>User Type</th>
+                    <th>Admin</th>
+                    <th>MFA</th>
+                    <th>Authenticator Passwordless</th>
+                    <th>FIDO2</th>
+                    <th>WHfB</th>
+                    <th>Phishing Resistant</th>
+                    <th>Risk</th>
+                    <th>Default MFA Method</th>
+                    <th>Methods Registered</th>
+                    <th>Auth API Method Types</th>
+                    <th>Last Updated</th>
+                </tr>
+            </thead>
+            <tbody>
+                $($TableRows -join "`n")
+            </tbody>
+        </table>
+    </div>
+
+    <div class="footer">
+        Generated using Microsoft Graph PowerShell | Authentication Methods + MFA Registration Report
+    </div>
+
+</div>
+
+<script>
+function applyFilters() {
+    var searchValue = document.getElementById("searchBox").value.toLowerCase();
+    var filterValue = document.getElementById("filterDropdown").value;
+    var rows = document.querySelectorAll("#mfaTable tbody tr");
+    var visibleCount = 0;
+
+    rows.forEach(function(row) {
+        var rowText = row.innerText.toLowerCase();
+        var show = true;
+
+        if (searchValue && rowText.indexOf(searchValue) === -1) {
+            show = false;
+        }
+
+        if (filterValue === "admin" && row.dataset.admin !== "yes") {
+            show = false;
+        }
+
+        if (filterValue === "mfa" && row.dataset.mfa !== "yes") {
+            show = false;
+        }
+
+        if (filterValue === "nomfa" && row.dataset.mfa !== "no") {
+            show = false;
+        }
+
+        if (filterValue === "authpwdless" && row.dataset.auth !== "yes") {
+            show = false;
+        }
+
+        if (filterValue === "fido2" && row.dataset.fido2 !== "yes") {
+            show = false;
+        }
+
+        if (filterValue === "whfb" && row.dataset.whfb !== "yes") {
+            show = false;
+        }
+
+        if (filterValue === "phish" && row.dataset.phish !== "yes") {
+            show = false;
+        }
+
+        if (filterValue === "high" && row.dataset.risk !== "high") {
+            show = false;
+        }
+
+        if (filterValue === "medium" && row.dataset.risk !== "medium") {
+            show = false;
+        }
+
+        if (filterValue === "low" && row.dataset.risk !== "low") {
+            show = false;
+        }
+
+        row.style.display = show ? "" : "none";
+
+        if (show) {
+            visibleCount++;
+        }
+    });
+
+    document.getElementById("visibleCount").innerText = visibleCount;
+}
+
+function exportCSV() {
+    var rows = document.querySelectorAll("#mfaTable tr");
+    var csv = [];
+
+    rows.forEach(function(row) {
+        if (row.style.display === "none") {
+            return;
+        }
+
+        var cols = row.querySelectorAll("td, th");
+        var rowData = [];
+
+        cols.forEach(function(col) {
+            rowData.push('"' + col.innerText.replace(/"/g, '""') + '"');
+        });
+
+        csv.push(rowData.join(","));
+    });
+
+    var blob = new Blob([csv.join("\n")], { type: "text/csv;charset=utf-8;" });
+    var link = document.createElement("a");
+
+    link.href = URL.createObjectURL(blob);
+    link.download = "MFA_Executive_Report.csv";
+    link.click();
+}
+
+function exportExcel() {
+    var originalTable = document.getElementById("mfaTable");
+    var clonedTable = originalTable.cloneNode(true);
+    var originalRows = originalTable.querySelectorAll("tbody tr");
+    var clonedRows = clonedTable.querySelectorAll("tbody tr");
+
+    for (var i = clonedRows.length - 1; i >= 0; i--) {
+        if (originalRows[i] && originalRows[i].style.display === "none") {
+            clonedRows[i].remove();
+        }
+    }
+
+    var html = clonedTable.outerHTML;
+    var blob = new Blob(['\ufeff', html], { type: "application/vnd.ms-excel" });
+    var link = document.createElement("a");
+
+    link.href = URL.createObjectURL(blob);
+    link.download = "MFA_Executive_Report.xls";
+    link.click();
+}
+</script>
+
+</body>
+</html>
+"@
+
+# ================================
+# Export HTML Report
+# ================================
+
+$Html | Out-File -FilePath $ReportPath -Encoding UTF8
+
+Write-Host ""
+Write-Host "MFA Executive Dashboard generated successfully." -ForegroundColor Green
+Write-Host "Report path: $ReportPath" -ForegroundColor Cyan
+
+Start-Process $ReportPath
